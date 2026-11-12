@@ -11,14 +11,31 @@ const GEMINI_URL =
   "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions";
 const GEMINI_KEY = process.env.GEMINI_KEY; // chave do Google AI Studio
 const PROXY_KEY = process.env.PROXY_KEY || ""; // senha para proteger o seu proxy
+
+// Se você definir MODELS no Render, ela substitui esta lista padrão.
 const MODELS = (
   process.env.MODELS ||
-  "gemini-3.8-flash,gemini-3.7-flash,gemini-3.6-flash,gemini-3.5-flash"
+  [
+    "gemini-3.8-flash",
+    "gemini-3.7-flash",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite",
+    "gemini-3-flash-preview",
+  ].join(",")
 )
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
+
+// Tempo de "molho" após 429 (limite de uso)
 const COOLDOWN_MS = Number(process.env.COOLDOWN_SECONDS || 60) * 1000;
+// Tempo de "molho" após 503 (modelo sobrecarregado) ou erro de rede
+const OVERLOAD_COOLDOWN_MS =
+  Number(process.env.OVERLOAD_COOLDOWN_SECONDS || 20) * 1000;
+// Tempo máximo esperando cada modelo responder (evita o Janitor desistir antes)
+const TIMEOUT_MS = Number(process.env.TIMEOUT_SECONDS || 15) * 1000;
 
 // Erros que fazem o proxy passar para o próximo modelo
 const RETRY_STATUS = [404, 408, 429, 500, 502, 503, 504];
@@ -61,6 +78,12 @@ function sanitizeMessages(msgs) {
   return out;
 }
 
+function describeError(e) {
+  if (e.name === "AbortError") return `timeout (> ${TIMEOUT_MS / 1000}s)`;
+  const cause = e.cause ? ` (${e.cause.code || e.cause.message})` : "";
+  return `erro de rede: ${e.message}${cause}`;
+}
+
 // ---------- Rota principal ----------
 async function handleChat(req, res) {
   if (!GEMINI_KEY) {
@@ -87,12 +110,28 @@ async function handleChat(req, res) {
   base.messages = sanitizeMessages(base.messages);
   const wantsStream = !!base.stream;
 
+  // Se o cliente (Janitor) desconectar, paramos de tentar modelos
+  let clientGone = false;
+  let currentAc = null;
+  res.on("close", () => {
+    if (!res.writableFinished) {
+      clientGone = true;
+      if (currentAc) currentAc.abort();
+    }
+  });
+
   // Modelos fora de cooldown primeiro; se todos estiverem, tenta todos mesmo assim
   const now = Date.now();
   const available = MODELS.filter((m) => (cooldown[m] || 0) <= now);
   const order = available.length ? available : MODELS;
 
   for (const model of order) {
+    if (clientGone) return;
+
+    const ac = new AbortController();
+    currentAc = ac;
+    const timer = setTimeout(() => ac.abort(), TIMEOUT_MS);
+
     try {
       const r = await fetch(GEMINI_URL, {
         method: "POST",
@@ -101,12 +140,15 @@ async function handleChat(req, res) {
           Authorization: `Bearer ${GEMINI_KEY}`,
         },
         body: JSON.stringify({ ...base, model }),
+        signal: ac.signal,
       });
 
       if (r.ok) {
         res.setHeader("X-Used-Model", model);
 
         if (wantsStream) {
+          // O timeout vale só até os cabeçalhos chegarem
+          clearTimeout(timer);
           res.status(200);
           res.setHeader(
             "Content-Type",
@@ -135,16 +177,22 @@ async function handleChat(req, res) {
       console.log(`[${model}] ${lastErrors[model]}`);
 
       if (r.status === 429) cooldown[model] = Date.now() + COOLDOWN_MS;
+      if (r.status === 503) cooldown[model] = Date.now() + OVERLOAD_COOLDOWN_MS;
       if (RETRY_STATUS.includes(r.status)) continue;
 
       // Outros erros (ex.: 400) não adianta repetir: devolve ao Janitor
       return res.status(r.status).type("application/json").send(errText);
     } catch (e) {
-      lastErrors[model] = "erro de rede: " + e.message;
+      if (clientGone) return;
+      lastErrors[model] = describeError(e);
+      cooldown[model] = Date.now() + OVERLOAD_COOLDOWN_MS;
       console.log(`[${model}] ${lastErrors[model]}`);
+    } finally {
+      clearTimeout(timer);
     }
   }
 
+  if (clientGone) return;
   res.status(503).json({
     error: { message: "Todos os modelos falharam", details: lastErrors },
   });
@@ -167,9 +215,13 @@ app.get("/", (req, res) => {
     status: "ok",
     gemini_key_configurada: !!GEMINI_KEY,
     proxy_protegido: !!PROXY_KEY,
+    timeout_segundos: TIMEOUT_MS / 1000,
     modelos: MODELS.map((m) => ({
       modelo: m,
-      em_cooldown_segundos: Math.max(0, Math.ceil(((cooldown[m] || 0) - now) / 1000)),
+      em_cooldown_segundos: Math.max(
+        0,
+        Math.ceil(((cooldown[m] || 0) - now) / 1000)
+      ),
       ultimo_erro: lastErrors[m] || null,
     })),
   });
